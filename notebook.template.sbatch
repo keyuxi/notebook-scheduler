@@ -20,58 +20,75 @@ fi
 
 hostname > $INSTALL_DIR/current-host
 
-R_PORT=<R_PORT>
-JUPYTER_PORT=<JUPYTER_PORT>
-CODE_SERVER_PORT=<CODE_SERVER_PORT>
+# Create temporary directory to be populated with directories to bind-mount in the container
+# where writable file systems are necessary. Adjust path as appropriate for your computing environment.
+workdir=$(python -c 'import tempfile; print(tempfile.mkdtemp())')
 
-module load gsl rstudio R/4.0.2 code-server
+mkdir -p -m 700 ${workdir}/run ${workdir}/tmp ${workdir}/var/lib/rstudio-server
+cat > ${workdir}/database.conf <<END
+provider=sqlite
+directory=/var/lib/rstudio-server
+END
 
-RSERVER_PATH="<RSERVER_BINARY>"
-RSERVER_EXTRA_ARGS="<RSERVER_EXTRA_ARGS>"
+# Set OMP_NUM_THREADS to prevent OpenBLAS (and any other OpenMP-enhanced
+# libraries used by R) from spawning more threads than the number of processors
+# allocated to the job.
+#
+# Set R_LIBS_USER to a path specific to rocker/rstudio to avoid conflicts with
+# personal libraries from any R installation in the host environment
 
-cd $HOME
+cat > ${workdir}/rsession.sh <<END
+#!/bin/sh
+export OMP_NUM_THREADS=${SLURM_JOB_CPUS_PER_NODE}
+export R_LIBS_USER=${OAK}/kyx/software/rocker-chromatin/macs2
+exec /usr/lib/rstudio-server/bin/rsession "\${@}"
+END
 
-export RSTUDIO_PASSWORD=$(cat $INSTALL_DIR/rstudio_password.txt)
-"$RSERVER_PATH" $RSERVER_EXTRA_ARGS \
-	--www-port=$R_PORT \
-	--auth-none 0 \
-	--rsession-which-r `which R` \
-	--auth-pam-helper-path "$INSTALL_DIR/rserver_auth.sh" \
-  	--auth-encrypt-password 0 \
-	--rsession-config-file $INSTALL_DIR/rsession.conf \
-	2> $INSTALL_DIR/rserver.err &
-R_PID=$!
-jupyter lab \
-	--no-browser \
-	--ip=127.0.0.1 \
-	--port=$JUPYTER_PORT \
-	2> $INSTALL_DIR/jupyter.err &
-JUPYTER_PID=$!
+chmod +x ${workdir}/rsession.sh
 
-CODE_SERVER_DATAROOT="$HOME/.local/share/code-server"
-CODE_SERVER_USER_DIR="$CODE_SERVER_DATAROOT/User"
-export PASSWORD=$(cat $INSTALL_DIR/rstudio_password.txt) 
-code-server \
-    --auth="password" \
-    --bind-addr="0.0.0.0:$CODE_SERVER_PORT" \
-    --disable-telemetry \
-    --disable-update-check \
-    --ignore-last-opened \
-    --extensions-dir="$CODE_SERVER_DATAROOT/extensions" \
-    --user-data-dir="$CODE_SERVER_DATAROOT" \
-    "$HOME" 2> $INSTALL_DIR/code-server.err &
-CODE_SERVER_PID=$!
+export SINGULARITY_BIND="${workdir}/run:/run,${workdir}/tmp:/tmp,${workdir}/database.conf:/etc/rstudio/database.conf,${workdir}/rsession.sh:/etc/rstudio/rsession.sh,${workdir}/var/lib/rstudio-server:/var/lib/rstudio-server"
 
+# Do not suspend idle sessions.
+# Alternative to setting session-timeout-minutes=0 in /etc/rstudio/rsession.conf
+# https://github.com/rstudio/rstudio/blob/v1.4.1106/src/cpp/server/ServerSessionManager.cpp#L126
+export SINGULARITYENV_RSTUDIO_SESSION_TIMEOUT=0
 
-# The server is running in the background; kill it when the time is up so it can shut down gracefully
-# This funny workaround is because Sherlock apparently decided to ban the word s-l-e-e-p in job scripts.
-# Given that running rstudio and jupyter via OnDemand is allowed, seems like this should be allowed
-SLEE="slee"
-${SLEE}p <HOURS>h
+export SINGULARITYENV_USER=$(id -un)
+export SINGULARITYENV_PASSWORD=keyuxi
+# export SINGULARITYENV_PASSWORD=$(openssl rand -base64 15)
+# get unused socket per https://unix.stackexchange.com/a/132524
+# tiny race condition between the python & singularity commands
+readonly PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
+echo $PORT > $INSTALL_DIR/current-port
 
-wait
-kill $R_PID 
-kill $JUPYTER_PID
-kill $CODE_SERVER_PID
-rm $INSTALLL_DIR/current-host
+cat 1>&2 <<END
+1. SSH tunnel from your workstation using the following command:
 
+   ssh -N -L 8787:${HOSTNAME}:${PORT} ${SINGULARITYENV_USER}@login.sherlock.stanford.edu
+
+   and point your web browser to http://localhost:8787
+
+2. log in to RStudio Server using the following credentials:
+
+   user: ${SINGULARITYENV_USER}
+   password: ${SINGULARITYENV_PASSWORD}
+
+When done using RStudio Server, terminate the job by:
+
+1. Exit the RStudio Session ("power" button in the top right corner of the RStudio window)
+2. Issue the following command on the login node:
+
+      scancel -f ${SLURM_JOB_ID}
+
+Current time is ${date}
+END
+
+singularity exec --cleanenv /home/groups/wjg/kyx/bms_analysis/Singularity/chromatin-base-0.0.4.sif \
+    /usr/lib/rstudio-server/bin/rserver --www-port ${PORT} \
+            --auth-none=0 \
+            --auth-pam-helper-path=pam-helper \
+            --auth-stay-signed-in-days=30 \
+            --auth-timeout-minutes=0 \
+            --rsession-path=/etc/rstudio/rsession.sh \
+            --server-user kyx
+printf 'rserver exited' 1>&2

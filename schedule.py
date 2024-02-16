@@ -5,6 +5,7 @@
 # schedule.py run-next -- run the next job on sherlock at scheduled time, 
 # schedule.py run-now hours cpus mem_gb -- start a notebook immediately on Sherlock.
 # schedule.py get -- print the current schedule from sherlock
+# schedule.py connect -- print the ssh command from `notebook.err`
 
 # install.py install -- set installation
 # install.py password -- reset passwords
@@ -56,6 +57,9 @@ schedule.py run-now hours cpus mem_gb
 schedule.py get
     Print the current schedule from sherlock.
     (Run on local computer or on Sherlock)
+
+schedule.py connect
+    Fetch contents of `notebook.err` and connect to the running job
 """.format(**defaults)
 
 def main():
@@ -72,6 +76,10 @@ def main():
         cmd_run_now(args)
     elif command == "get":
         cmd_get()
+    elif command == "connect":
+        cmd_connect()
+    elif command == "squeue":
+        cmd_squeue()
 
 def cmd_reset(schedule):
     ## Parse schedule as a check, then copy to sherlock
@@ -145,6 +153,35 @@ def cmd_get():
     _, next_time, _ = next_scheduled(entries, datetime.datetime.today())
     print("Next job running at:", next_time.ctime())
     print(schedule)
+
+def cmd_squeue():
+    config = json.load(open("config.json"))
+    sherlock_user = config["SHERLOCK_USER"]
+    squeue_msg = install.get_sherlock_output(
+        ["squeue", "-u", sherlock_user]
+    ).decode().strip()
+    print('\n', squeue_msg, '\n')
+    
+def cmd_connect():
+    config = json.load(open("config.json"))
+    install_dir = config["INSTALL_PATH"]
+    print("Fetching ssh information from {}/notebook.err on Sherlock".format(install_dir))
+    err_msg = install.get_sherlock_output(
+        ["cat", install_dir + "/notebook.err"]).decode().strip()
+    print('\n', err_msg, '\n')
+    
+    timeout_ind = err_msg.find("DUE TO TIME LIMIT ***")
+    if timeout_ind == -1:
+        # cannot find time out message: our new job is alread running
+        
+        # Some hardcoding here to find the ssh command to run
+        start_ind = err_msg.find('ssh -N -L')
+        end_ind = err_msg.find('.edu')
+        ssh_command = err_msg[start_ind:end_ind+4].split(' ')
+        
+        subprocess.run(ssh_command)
+    else:
+        print("No job is currently running. Still waiting for new job to run if you just submitted one.")
 
 def cmd_run_now(args): 
     config = json.load(open("config.json"))
@@ -304,7 +341,7 @@ def parse_args(argv):
     command = argv[1]
     args = None
 
-    if command not in ["reset", "run-now", "run-next", "get"]:
+    if command not in ["reset", "run-now", "run-next", "get", "connect", "squeue"]:
         print("Error: command {} not recognized".format(command))
         print(usage)
         sys.exit(1)
